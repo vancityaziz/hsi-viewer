@@ -389,7 +389,7 @@ async function scanRGB(onProgress) {
   const bpp = dtype.bytes;
   const nPix = samples * lines;
   const rgb = { r: new Float32Array(nPix), g: new Float32Array(nPix), b: new Float32Array(nPix) };
-  const myToken = ++S.scanToken;
+  const myToken = S.scanToken;
 
   if (interleave === 'bsq') {
     const bandBytes = samples * lines * bpp;
@@ -465,7 +465,7 @@ async function scanRGBPreview(onProgress) {
     b: new Float32Array(nPix),
     w: pW, h: pH, stride,
   };
-  const myToken = ++S.scanToken;
+  const myToken = S.scanToken;
 
   if (interleave === 'bsq') {
     const bandBytes = samples * lines * bpp;
