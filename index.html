@@ -692,6 +692,19 @@
             <label><input type="checkbox" id="wireframe-toggle"> Wireframe</label>
             <label><input type="checkbox" id="downsample-toggle" checked> Downsample for speed</label>
           </div>
+          <div class="film-check-row">
+            <label style="gap: 8px">
+              Spike smoothing:
+              <select id="smoothing-mode" style="padding: 3px 6px; font-size: clamp(12px, 0.9vw, 14px); background: var(--panel); color: var(--text); border: 1px solid var(--border-strong); border-radius: 4px;">
+                <option value="none">None (raw)</option>
+                <option value="mean3">3×3 mean</option>
+                <option value="median3" selected>3×3 median</option>
+                <option value="median3-mean3">Median then mean (3×3)</option>
+                <option value="mean5">5×5 mean</option>
+                <option value="gaussian5">5×5 Gaussian</option>
+              </select>
+            </label>
+          </div>
           <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: clamp(12px, 0.9vw, 14px); color: var(--muted)">
             <span>Region:</span>
             <button class="btn" id="crop-btn">Crop to film area</button>
@@ -2688,11 +2701,11 @@ async function buildHeightMap() {
     if (h < hMin) hMin = h;
   }
 
-  F.heightMap = height;
+  F.heightMapRaw = height;
   F.heightMax = hMax;
   F.heightMin = hMin;
-  F.heightClipMax = robustMax(height);
   F.roi = null;  // fresh heightmap → no crop yet
+  applySmoothingFromRaw();  // sets F.heightMap and F.heightClipMax based on current smoothing choice
 
   const wlLabel = (pk.wl > 100 && pk.wl < 3000) ? `${pk.wl.toFixed(1)} nm` : `band ${pk.band}`;
   const shLabel = (S.wavelengths[pk.bL] > 100)
@@ -2840,6 +2853,112 @@ async function renderCurrentView() {
       });
     }
   }
+}
+
+
+/* ------------------------------------------------------------------ *
+ * Spatial smoothing filters for the height map.
+ * Raw per-pixel peak depth is measured independently, so any spectral
+ * noise in the peak or shoulder bands becomes a single-pixel spike in
+ * the height map. Median rejects those spikes without blurring edges;
+ * mean/Gaussian smooth broader noise but soften edges.
+ * ------------------------------------------------------------------ */
+
+function smoothMean(src, cols, rows, k) {
+  const half = (k - 1) >> 1;
+  const out = new Float32Array(src.length);
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      let sum = 0, n = 0;
+      const r0 = Math.max(0, r - half), r1 = Math.min(rows - 1, r + half);
+      const c0 = Math.max(0, c - half), c1 = Math.min(cols - 1, c + half);
+      for (let rr = r0; rr <= r1; rr++) {
+        const base = rr * cols;
+        for (let cc = c0; cc <= c1; cc++) { sum += src[base + cc]; n++; }
+      }
+      out[r * cols + c] = sum / n;
+    }
+  }
+  return out;
+}
+
+function smoothMedian(src, cols, rows, k) {
+  const half = (k - 1) >> 1;
+  const out = new Float32Array(src.length);
+  const win = new Float32Array(k * k);
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      let n = 0;
+      const r0 = Math.max(0, r - half), r1 = Math.min(rows - 1, r + half);
+      const c0 = Math.max(0, c - half), c1 = Math.min(cols - 1, c + half);
+      for (let rr = r0; rr <= r1; rr++) {
+        const base = rr * cols;
+        for (let cc = c0; cc <= c1; cc++) win[n++] = src[base + cc];
+      }
+      const view = win.subarray(0, n);
+      // In-place insertion sort — tiny arrays, faster than Array.sort
+      for (let i = 1; i < n; i++) {
+        const v = view[i]; let j = i - 1;
+        while (j >= 0 && view[j] > v) { view[j + 1] = view[j]; j--; }
+        view[j + 1] = v;
+      }
+      out[r * cols + c] = view[n >> 1];
+    }
+  }
+  return out;
+}
+
+// 5x5 discrete Gaussian, sigma ~= 1.0, integer approximation (sum=273).
+const GAUSS5 = [
+  1,  4,  7,  4, 1,
+  4, 16, 26, 16, 4,
+  7, 26, 41, 26, 7,
+  4, 16, 26, 16, 4,
+  1,  4,  7,  4, 1,
+];
+function smoothGaussian5(src, cols, rows) {
+  const out = new Float32Array(src.length);
+  const half = 2;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      let sum = 0, wsum = 0;
+      for (let dr = -half; dr <= half; dr++) {
+        const rr = r + dr; if (rr < 0 || rr >= rows) continue;
+        const base = rr * cols;
+        for (let dc = -half; dc <= half; dc++) {
+          const cc = c + dc; if (cc < 0 || cc >= cols) continue;
+          const w = GAUSS5[(dr + half) * 5 + (dc + half)];
+          sum += src[base + cc] * w; wsum += w;
+        }
+      }
+      out[r * cols + c] = sum / wsum;
+    }
+  }
+  return out;
+}
+
+function applySmoothingFromRaw() {
+  if (!F.heightMapRaw) return;
+  const mode = (document.getElementById('smoothing-mode') || {}).value || 'median3';
+  const cols = S.samples, rows = S.lines;
+  let sm;
+  if (mode === 'none') sm = F.heightMapRaw;
+  else if (mode === 'mean3') sm = smoothMean(F.heightMapRaw, cols, rows, 3);
+  else if (mode === 'median3') sm = smoothMedian(F.heightMapRaw, cols, rows, 3);
+  else if (mode === 'mean5') sm = smoothMean(F.heightMapRaw, cols, rows, 5);
+  else if (mode === 'gaussian5') sm = smoothGaussian5(F.heightMapRaw, cols, rows);
+  else if (mode === 'median3-mean3') {
+    const med = smoothMedian(F.heightMapRaw, cols, rows, 3);
+    sm = smoothMean(med, cols, rows, 3);
+  }
+  else sm = F.heightMapRaw;
+  F.heightMap = sm;
+  F.heightClipMax = robustMax(sm);
+  let mn = Infinity, mx = -Infinity;
+  for (let i = 0; i < sm.length; i++) {
+    const v = sm[i]; if (v < mn) mn = v; if (v > mx) mx = v;
+  }
+  F.heightMin = mn; F.heightMax = mx;
 }
 
 /* ---- ROI (region-of-interest) crop ----
@@ -3368,6 +3487,17 @@ function dispose() {
 }
 
 window.__film3D = { initScene, updateSurface, setExag, setWireframe, setROI, resetView, onResize, dispose };
+
+document.addEventListener('DOMContentLoaded', () => {
+  const sel = document.getElementById('smoothing-mode');
+  if (!sel) return;
+  sel.addEventListener('change', () => {
+    if (!F.heightMapRaw) return;
+    applySmoothingFromRaw();
+    if (typeof renderCurrentView === 'function') renderCurrentView();
+  });
+});
+
 })();
 </script>
 </body>
